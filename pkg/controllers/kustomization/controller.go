@@ -355,21 +355,14 @@ func (c *Controller) collectDeps(ks *manifest.Kustomization) []manifest.Dependen
 			continue
 		}
 		depID := manifest.NamedResource{Kind: ref.Kind, Namespace: ks.Namespace, Name: ref.Name}
-		var producers []manifest.NamedResource
+		deps = append(deps, manifest.DependencyRef{NamedResource: depID})
 		if f := c.Filter(); f != nil {
 			for _, producer := range f.ProducersFor(depID) {
 				if producer == ks.Named() || producer.Kind != manifest.KindKustomization {
 					continue
 				}
-				producers = append(producers, producer)
+				deps = append(deps, manifest.DependencyRef{NamedResource: producer})
 			}
-		}
-		if len(producers) == 0 {
-			deps = append(deps, manifest.DependencyRef{NamedResource: depID})
-			continue
-		}
-		for _, producer := range producers {
-			deps = append(deps, manifest.DependencyRef{NamedResource: producer})
 		}
 	}
 	return deps

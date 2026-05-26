@@ -3,6 +3,9 @@ package kustomization
 import (
 	"testing"
 
+	kustomizev1 "github.com/fluxcd/kustomize-controller/api/v1"
+
+	"github.com/home-operations/flate/pkg/change"
 	"github.com/home-operations/flate/pkg/manifest"
 	"github.com/home-operations/flate/pkg/store"
 )
@@ -46,6 +49,53 @@ func TestCollectDeps_NoParentNoExtraDep(t *testing.T) {
 // becomes a real dependency. Without this, KS-A would race the CM
 // that KS-B's render emits, and Prepare would silently expand with
 // empty values for any var that should have come from KS-B's CM.
+func TestCollectDeps_AppendsSubstituteFromConfigMapAndProducer(t *testing.T) {
+	consumer := &manifest.Kustomization{
+		Name: "cluster-apps", Namespace: "flux-system",
+		PostBuildSubstituteFrom: []manifest.SubstituteReference{{Kind: manifest.KindConfigMap, Name: "cluster-settings"}},
+	}
+	producer := &manifest.Kustomization{
+		Name: "cluster-vars", Namespace: "flux-system",
+		KustomizationSpec: kustomizev1.KustomizationSpec{Path: "kubernetes/flux/vars"},
+	}
+	cmID := manifest.NamedResource{Kind: manifest.KindConfigMap, Name: "cluster-settings"}
+	cm := &manifest.ConfigMap{Name: "cluster-settings"}
+	s := store.New()
+	s.AddObject(consumer)
+	s.AddObject(producer)
+	s.AddObject(cm)
+	f := change.NewFilter(
+		change.NewSet([]string{"kubernetes/apps/communication/ntfy/app/helmrelease.yaml"}),
+		map[manifest.NamedResource]string{
+			consumer.Named(): "kubernetes/flux/cluster-apps.yaml",
+			producer.Named(): "kubernetes/flux/cluster-vars.yaml",
+			cmID:             "kubernetes/flux/vars/cluster-settings.yaml",
+		},
+		"",
+		s,
+	)
+	c := New(s, nil, nil, false)
+	c.Configure(Options{Filter: f})
+
+	deps := c.collectDeps(consumer)
+	want := []manifest.NamedResource{
+		{Kind: manifest.KindConfigMap, Namespace: "flux-system", Name: "cluster-settings"},
+		producer.Named(),
+	}
+	for _, id := range want {
+		var found bool
+		for _, d := range deps {
+			if d.NamedResource == id {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("expected dep %s in %+v", id, deps)
+		}
+	}
+}
+
 func TestCollectDeps_AppendsSubstituteFromConfigMap(t *testing.T) {
 	ks := &manifest.Kustomization{
 		Name: "apps", Namespace: "flux-system",
