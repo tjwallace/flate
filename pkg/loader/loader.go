@@ -177,6 +177,9 @@ func (w *walker) descend(ctx context.Context, dir string) (int, error) {
 		}
 		if k.isKustomizeComponent() {
 			slog.Debug("loader: skipping kustomize Component directory", "dir", dir)
+			if w.loader.Options.DiscoveryOnly {
+				return w.walkComponentData(ctx, dir, k)
+			}
 			return 0, nil
 		}
 		return w.walkKustomize(ctx, dir, k)
@@ -286,6 +289,28 @@ func (w *walker) walkKustomize(ctx context.Context, dir string, k *kustomization
 	return count, nil
 }
 
+// walkComponentData records direct ConfigMap/Secret resources from
+// kustomize Components during DiscoveryOnly loads without publishing
+// templated Flux CRs as standalone objects.
+func (w *walker) walkComponentData(ctx context.Context, dir string, k *kustomization) (int, error) {
+	for _, r := range k.Resources {
+		if cerr := ctx.Err(); cerr != nil {
+			return 0, cerr
+		}
+		abs, ok := resolveDataPath(dir, r)
+		if !ok || w.ignore.matches(abs, w.scanRoot) || !isManifestFile(abs) {
+			continue
+		}
+		if info, err := os.Stat(abs); err != nil || info.IsDir() {
+			continue
+		}
+		if err := w.loader.recordDataFile(abs); err != nil {
+			slog.Warn("loader: component data file failed to parse", "path", abs, "err", err)
+		}
+	}
+	return 0, nil
+}
+
 // walkAdHoc handles entry points that aren't themselves kustomize
 // packages: walks the filesystem tree, loading every YAML, and
 // switching to walkKustomize when it encounters a sub-directory
@@ -316,6 +341,11 @@ func (w *walker) walkAdHoc(ctx context.Context, root string) (int, error) {
 			// descending again.
 			if k := readKustomization(path); k != nil {
 				if k.isKustomizeComponent() {
+					if w.loader.Options.DiscoveryOnly {
+						if _, err := w.walkComponentData(ctx, path, k); err != nil {
+							return err
+						}
+					}
 					return filepath.SkipDir
 				}
 				w.visited[path] = struct{}{}
@@ -374,6 +404,24 @@ func (l *Loader) loadFile(path string) (int, error) {
 		count++
 	}
 	return count, nil
+}
+
+func (l *Loader) recordDataFile(path string) error {
+	objs, err := parseFile(path, manifest.ParseDocOptions{WipeSecrets: l.Options.WipeSecrets})
+	if err != nil {
+		return err
+	}
+	for _, obj := range objs {
+		id := obj.Named()
+		if id.Kind != manifest.KindConfigMap && id.Kind != manifest.KindSecret {
+			continue
+		}
+		if l.Existence != nil {
+			l.Existence.Record(id, path)
+		}
+		l.recordSource(id, path)
+	}
+	return nil
 }
 
 // recordGenerators appends generator records observed during a walk.

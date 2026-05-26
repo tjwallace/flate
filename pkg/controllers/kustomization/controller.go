@@ -309,12 +309,14 @@ func (c *Controller) reconcile(ctx context.Context, ks *manifest.Kustomization) 
 // CEL ReadyExpr), the source ref, the implicit structural parent (the
 // enclosing Flux KS that renders us — must finish first so any
 // parent-render-time spec injections land before our reconcile), and
-// every non-Optional postBuild.substituteFrom ConfigMap.
+// every non-Optional postBuild.substituteFrom ConfigMap (or, in
+// changed-only mode, the unchanged producer Kustomization that renders
+// that ConfigMap).
 //
-// substituteFrom ConfigMap edges fix the race where the referenced CM
-// is emitted by another KS's render: without the edge, KS-A would
-// race KS-B and Prepare would silently expand with empty values for
-// vars that should have come from KS-B's CM. Flux's eventual-
+// substituteFrom ConfigMap/producer edges fix the race where the
+// referenced CM is emitted by another KS's render: without the edge,
+// KS-A would race KS-B and Prepare would silently expand with empty
+// values for vars that should have come from KS-B's CM. Flux's eventual-
 // consistency reconcile loop self-heals; flate is one-shot, so a
 // missed substitution shows up as broken rendered output.
 //
@@ -352,11 +354,23 @@ func (c *Controller) collectDeps(ks *manifest.Kustomization) []manifest.Dependen
 		if ref.Name == "" {
 			continue
 		}
-		deps = append(deps, manifest.DependencyRef{
-			NamedResource: manifest.NamedResource{
-				Kind: ref.Kind, Namespace: ks.Namespace, Name: ref.Name,
-			},
-		})
+		depID := manifest.NamedResource{Kind: ref.Kind, Namespace: ks.Namespace, Name: ref.Name}
+		var producers []manifest.NamedResource
+		if f := c.Filter(); f != nil {
+			for _, producer := range f.ProducersFor(depID) {
+				if producer == ks.Named() || producer.Kind != manifest.KindKustomization {
+					continue
+				}
+				producers = append(producers, producer)
+			}
+		}
+		if len(producers) == 0 {
+			deps = append(deps, manifest.DependencyRef{NamedResource: depID})
+			continue
+		}
+		for _, producer := range producers {
+			deps = append(deps, manifest.DependencyRef{NamedResource: producer})
+		}
 	}
 	return deps
 }

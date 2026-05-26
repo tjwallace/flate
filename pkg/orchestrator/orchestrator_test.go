@@ -12,6 +12,7 @@ import (
 	kustomizev1 "github.com/fluxcd/kustomize-controller/api/v1"
 
 	"github.com/home-operations/flate/internal/testutil"
+	"github.com/home-operations/flate/pkg/change"
 	"github.com/home-operations/flate/pkg/helm"
 	"github.com/home-operations/flate/pkg/manifest"
 	"github.com/home-operations/flate/pkg/store"
@@ -263,6 +264,125 @@ data: {k: v}
 		if !ok || info.Status != store.StatusReady {
 			t.Fatalf("%s status = (%+v, %v), want Ready", id, info, ok)
 		}
+	}
+}
+
+func TestOrchestrator_ChangedOnlyKeepsSubstituteFromProducer(t *testing.T) {
+	dir := t.TempDir()
+	testutil.WriteFile(t, dir, "kubernetes/flux/cluster-apps.yaml", `apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: cluster-apps
+  namespace: flux-system
+spec:
+  interval: 5m
+  path: ./kubernetes/apps
+  sourceRef:
+    kind: GitRepository
+    name: flux-system
+    namespace: flux-system
+  postBuild:
+    substituteFrom:
+      - kind: ConfigMap
+        name: cluster-settings
+`)
+	testutil.WriteFile(t, dir, "kubernetes/flux/cluster-vars.yaml", `apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: cluster-vars
+  namespace: flux-system
+spec:
+  interval: 5m
+  path: ./kubernetes/flux/vars
+  sourceRef:
+    kind: GitRepository
+    name: flux-system
+    namespace: flux-system
+`)
+	testutil.WriteFile(t, dir, "kubernetes/flux/vars/kustomization.yaml", `namespace: flux-system
+components:
+  - ../../components/cluster-settings
+`)
+	testutil.WriteFile(t, dir, "kubernetes/components/cluster-settings/kustomization.yaml", `apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+resources:
+  - cluster-settings.yaml
+`)
+	testutil.WriteFile(t, dir, "kubernetes/components/cluster-settings/cluster-settings.yaml", `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cluster-settings
+data:
+  CLUSTER_DOMAIN: example.test
+`)
+	testutil.WriteFile(t, dir, "kubernetes/apps/kustomization.yaml", `resources:
+  - communication/ntfy/ks.yaml
+`)
+	testutil.WriteFile(t, dir, "kubernetes/apps/communication/ntfy/ks.yaml", `apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: ntfy
+  namespace: communication
+spec:
+  interval: 5m
+  path: ./kubernetes/apps/communication/ntfy/app
+  sourceRef:
+    kind: GitRepository
+    name: flux-system
+    namespace: flux-system
+`)
+	testutil.WriteFile(t, dir, "kubernetes/apps/communication/ntfy/app/kustomization.yaml", `resources:
+  - helmrelease.yaml
+`)
+	// Suspended so the HelmRelease-only change drives changed-only
+	// ownership without requiring a real chart pull/template in this
+	// focused Kustomization dependency regression test.
+	testutil.WriteFile(t, dir, "kubernetes/apps/communication/ntfy/app/helmrelease.yaml", `apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: ntfy
+  namespace: communication
+  annotations:
+    ci.flux.home.arpa/flate-hr-test: "true"
+spec:
+  suspend: true
+  interval: 5m
+  chartRef:
+    kind: OCIRepository
+    name: ntfy
+    namespace: flux-system
+`)
+
+	o, err := New(Config{
+		Path:        dir,
+		WipeSecrets: true,
+		ExternalChanges: change.NewSet([]string{
+			"kubernetes/apps/communication/ntfy/app/helmrelease.yaml",
+		}),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := o.Bootstrap(context.Background()); err != nil {
+		t.Fatalf("Bootstrap: %v", err)
+	}
+	producerID := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "flux-system", Name: "cluster-vars"}
+	if !o.Filter().ShouldReconcile(producerID) {
+		t.Fatalf("unchanged substituteFrom producer %s is not in changed-only keep set; keep=%v", producerID, o.Filter().KeepNames())
+	}
+	if err := o.Run(context.Background()); err != nil {
+		if strings.Contains(err.Error(), "ConfigMap/flux-system/cluster-settings: dependency not found") {
+			t.Fatalf("changed-only skipped unchanged substituteFrom producer: %v; keep=%v", err, o.Filter().KeepNames())
+		}
+		t.Fatalf("Run: %v", err)
+	}
+
+	if art := o.Store().GetArtifact(producerID); art == nil {
+		t.Fatalf("unchanged substituteFrom producer %s was not reconciled; keep=%v", producerID, o.Filter().KeepNames())
+	}
+	cmID := manifest.NamedResource{Kind: manifest.KindConfigMap, Namespace: "flux-system", Name: "cluster-settings"}
+	if obj := o.Store().GetObject(cmID); obj == nil {
+		t.Fatalf("substituteFrom dependency %s was not materialized", cmID)
 	}
 }
 

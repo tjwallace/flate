@@ -101,6 +101,50 @@ metadata: {name: real, namespace: ns}
 	}
 }
 
+func TestLoader_DiscoveryOnlyRecordsComponentDataResources(t *testing.T) {
+	dir := t.TempDir()
+	testutil.WriteFile(t, dir, "components/settings/kustomization.yaml", `apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+resources:
+  - cluster-settings.yaml
+  - templated-ks.yaml
+`)
+	testutil.WriteFile(t, dir, "components/settings/cluster-settings.yaml", `apiVersion: v1
+kind: ConfigMap
+metadata: {name: cluster-settings}
+data: {CLUSTER_DOMAIN: example.test}
+`)
+	testutil.WriteFile(t, dir, "components/settings/templated-ks.yaml", `apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata: {name: "${APP}-leak", namespace: ns}
+spec:
+  path: ./irrelevant
+  sourceRef: {kind: GitRepository, name: flux-system}
+  interval: 1h
+`)
+	s := store.New()
+	existence := NewExistenceIndex()
+	sourceFiles := map[manifest.NamedResource]string{}
+	l := New(s)
+	l.Options.DiscoveryOnly = true
+	l.Existence = existence
+	l.SourceRoot = dir
+	l.SourceFiles = sourceFiles
+	if _, err := l.Load(context.Background(), dir); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	cmID := manifest.NamedResource{Kind: manifest.KindConfigMap, Name: "cluster-settings"}
+	if _, ok := existence.Get(cmID); !ok {
+		t.Fatalf("component ConfigMap should be existence-indexed")
+	}
+	if got := sourceFiles[cmID]; got != "components/settings/cluster-settings.yaml" {
+		t.Fatalf("component ConfigMap sourceFiles=%q", got)
+	}
+	if got := s.GetObject(manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "ns", Name: "${APP}-leak"}); got != nil {
+		t.Errorf("Component-subtree Flux resource should not be loaded; got %v", got)
+	}
+}
+
 // isKustomizeComponent must catch the JSON form too — a substring
 // check on "kind: Component" against the file's first 256 bytes missed
 // `kustomization.json` outright (the JSON form is "kind":"Component"

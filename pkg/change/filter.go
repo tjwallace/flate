@@ -43,6 +43,15 @@ type Filter struct {
 	// transitiveDeps does internally).
 	objs ObjectLister
 
+	// Producers map file-backed data resources (ConfigMaps/Secrets) to
+	// the Flux Kustomizations whose spec.path renders them. Some data
+	// deps are not directly materialized in DiscoveryOnly mode (or are
+	// indexed before kustomize namespace inheritance), so keeping only
+	// the data object is insufficient: the unchanged producer KS must
+	// also reconcile to emit the runtime object.
+	producersByID   map[manifest.NamedResource][]manifest.NamedResource
+	producersByName map[nameKey][]manifest.NamedResource
+
 	// OnAdd, when non-nil, fires for every id newly added to the
 	// keep set by AddEmitted / Add (including transitive-dep
 	// recursion). The orchestrator wires this to refire
@@ -285,7 +294,7 @@ func (f *Filter) addRecursiveLocked(id manifest.NamedResource) []manifest.NamedR
 		if f.objs == nil {
 			continue
 		}
-		for _, dep := range transitiveDeps(f.objs, cur) {
+		for _, dep := range f.transitiveDepsAndProducers(cur) {
 			if _, ok := f.primary[dep]; !ok {
 				stack = append(stack, dep)
 			}
@@ -331,6 +340,7 @@ func (f *Filter) resolve(objs ObjectLister) {
 	}
 
 	owners := buildOwnership(objs, f.repoRoot)
+	f.producersByID, f.producersByName = buildProducerIndex(f.sourceFiles, owners)
 	ownersHit := make(map[manifest.NamedResource]struct{})
 
 	for _, file := range f.changes.Paths() {
@@ -372,6 +382,15 @@ func (f *Filter) resolve(objs ObjectLister) {
 				enqueuePrimary(d)
 			} else {
 				enqueueAncestor(d)
+			}
+			// If a data dependency is rendered by another Flux
+			// Kustomization, that producer must run so the data object
+			// materializes. Keep producer KSes dependency-only here:
+			// their output is needed, but an unchanged producer should
+			// not become a primary emitter that cascades unrelated
+			// children into changed-only scope.
+			for _, producer := range f.producersFor(d) {
+				enqueueAncestor(producer)
 			}
 		}
 		// Also walk the structural-parent chain of any Flux
@@ -423,6 +442,79 @@ func (f *Filter) resolve(objs ObjectLister) {
 			f.keepByName[nameKey{id.Kind, id.Name}] = struct{}{}
 		}
 	}
+}
+
+// buildProducerIndex maps file-backed data resources to the
+// Kustomization(s) that render their files. Exact id matches cover
+// namespaced resources and finalized generators; the name map covers
+// the common kustomize-namespace case where DiscoveryOnly indexed a
+// raw ConfigMap/Secret with namespace="" but the consuming KS waits on
+// the rendered namespace.
+func buildProducerIndex(sourceFiles map[manifest.NamedResource]string, owners ownershipIndex) (map[manifest.NamedResource][]manifest.NamedResource, map[nameKey][]manifest.NamedResource) {
+	byID := make(map[manifest.NamedResource][]manifest.NamedResource)
+	byName := make(map[nameKey][]manifest.NamedResource)
+	for id, file := range sourceFiles {
+		if id.Kind != manifest.KindConfigMap && id.Kind != manifest.KindSecret {
+			continue
+		}
+		producers := owners.ownersOf(file)
+		if len(producers) == 0 {
+			continue
+		}
+		byID[id] = appendUniqueIDs(byID[id], producers...)
+		if id.Namespace == "" {
+			key := nameKey{id.Kind, id.Name}
+			byName[key] = appendUniqueIDs(byName[key], producers...)
+		}
+	}
+	return byID, byName
+}
+
+func (f *Filter) transitiveDepsAndProducers(id manifest.NamedResource) []manifest.NamedResource {
+	deps := transitiveDeps(f.objs, id)
+	if len(deps) == 0 {
+		return nil
+	}
+	out := make([]manifest.NamedResource, 0, len(deps))
+	for _, dep := range deps {
+		out = append(out, dep)
+		out = appendUniqueIDs(out, f.producersFor(dep)...)
+	}
+	return out
+}
+
+// ProducersFor returns Flux Kustomizations that render the file-backed
+// data resource id. It is populated only for enabled changed-only
+// filters and is used by controllers to add ordering edges for data
+// deps that otherwise arrive via another KS render.
+func (f *Filter) ProducersFor(id manifest.NamedResource) []manifest.NamedResource {
+	if !f.Enabled() {
+		return nil
+	}
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.producersFor(id)
+}
+
+func (f *Filter) producersFor(id manifest.NamedResource) []manifest.NamedResource {
+	if f == nil {
+		return nil
+	}
+	out := append([]manifest.NamedResource(nil), f.producersByID[id]...)
+	if id.Namespace != "" {
+		out = appendUniqueIDs(out, f.producersByName[nameKey{id.Kind, id.Name}]...)
+	}
+	return out
+}
+
+func appendUniqueIDs(base []manifest.NamedResource, ids ...manifest.NamedResource) []manifest.NamedResource {
+	for _, id := range ids {
+		if slices.Contains(base, id) {
+			continue
+		}
+		base = append(base, id)
+	}
+	return base
 }
 
 // Size returns the number of resources in the resolved keep set.
@@ -484,7 +576,8 @@ type ObjectLister interface {
 }
 
 // transitiveDeps returns the references id needs to render — chart
-// sources, KS sourceRef, valuesFrom. dependsOn is intentionally
+// sources, KS sourceRef, valuesFrom, and postBuild.substituteFrom
+// ConfigMaps. dependsOn is intentionally
 // excluded: it's a reconcile-ordering signal in real Flux, not a
 // content dependency, so it adds nothing to an offline render.
 // Skipped resources still get marked Ready by their controllers, so
@@ -511,12 +604,21 @@ func transitiveDeps(objs ObjectLister, id manifest.NamedResource) []manifest.Nam
 		if ks == nil {
 			return nil
 		}
-		if ks.SourceKind == "" || ks.SourceName == "" {
-			return nil
+		var out []manifest.NamedResource
+		if ks.SourceKind != "" && ks.SourceName != "" {
+			out = append(out, manifest.NamedResource{
+				Kind: ks.SourceKind, Namespace: ks.SourceNamespace, Name: ks.SourceName,
+			})
 		}
-		return []manifest.NamedResource{{
-			Kind: ks.SourceKind, Namespace: ks.SourceNamespace, Name: ks.SourceName,
-		}}
+		for _, ref := range ks.PostBuildSubstituteFrom {
+			if ref.Optional || ref.Kind != manifest.KindConfigMap || ref.Name == "" {
+				continue
+			}
+			out = append(out, manifest.NamedResource{
+				Kind: ref.Kind, Namespace: ks.Namespace, Name: ref.Name,
+			})
+		}
+		return out
 
 	case manifest.KindHelmChart:
 		// A HelmRelease chartRef pointing at a HelmChart CRD lands the

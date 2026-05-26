@@ -167,6 +167,61 @@ func TestFilter_StructuralParentOfOwnerKSAlsoKept(t *testing.T) {
 	}
 }
 
+func TestFilter_SubstituteFromConfigMapKeepsProducerKustomization(t *testing.T) {
+	clusterApps := &manifest.Kustomization{
+		Name: "cluster-apps", Namespace: "flux-system",
+		KustomizationSpec: kustomizev1.KustomizationSpec{Path: "kubernetes/apps"},
+		PostBuildSubstituteFrom: []manifest.SubstituteReference{{
+			Kind: manifest.KindConfigMap,
+			Name: "cluster-settings",
+		}},
+	}
+	clusterVars := &manifest.Kustomization{
+		Name: "cluster-vars", Namespace: "flux-system",
+		KustomizationSpec: kustomizev1.KustomizationSpec{
+			Path:       "kubernetes/flux/vars",
+			Components: []string{"../../components/cluster-settings"},
+		},
+	}
+	ntfy := &manifest.Kustomization{
+		Name: "ntfy", Namespace: "communication",
+		KustomizationSpec: kustomizev1.KustomizationSpec{Path: "kubernetes/apps/communication/ntfy/app"},
+	}
+
+	clusterAppsID := clusterApps.Named()
+	clusterVarsID := clusterVars.Named()
+	ntfyID := ntfy.Named()
+	hrID := manifest.NamedResource{Kind: manifest.KindHelmRelease, Namespace: "communication", Name: "ntfy"}
+	// DiscoveryOnly records this raw ConfigMap before kustomize's
+	// namespace directive has rendered it into flux-system. The filter
+	// must still find cluster-vars as the producer for cluster-apps's
+	// namespaced substituteFrom edge.
+	rawSettingsID := manifest.NamedResource{Kind: manifest.KindConfigMap, Name: "cluster-settings"}
+	renderedSettingsID := manifest.NamedResource{Kind: manifest.KindConfigMap, Namespace: "flux-system", Name: "cluster-settings"}
+
+	f := NewFilter(
+		NewSet([]string{"kubernetes/apps/communication/ntfy/app/helmrelease.yaml"}),
+		map[manifest.NamedResource]string{
+			clusterAppsID: "kubernetes/flux/cluster-apps.yaml",
+			clusterVarsID: "kubernetes/flux/cluster-vars.yaml",
+			ntfyID:        "kubernetes/apps/communication/ntfy/ks.yaml",
+			hrID:          "kubernetes/apps/communication/ntfy/app/helmrelease.yaml",
+			rawSettingsID: "kubernetes/components/cluster-settings/cluster-settings.yaml",
+		},
+		"",
+		mapLister{clusterAppsID: clusterApps, clusterVarsID: clusterVars, ntfyID: ntfy},
+	)
+
+	for _, id := range []manifest.NamedResource{clusterAppsID, ntfyID, hrID, renderedSettingsID, clusterVarsID} {
+		if !f.ShouldReconcile(id) {
+			t.Errorf("expected %s in keep; keep=%v", id, f.KeepNames())
+		}
+	}
+	if _, primary := f.primary[clusterVarsID]; primary {
+		t.Errorf("unchanged substituteFrom producer should be dependency-only, not primary; keep=%v", f.KeepNames())
+	}
+}
+
 func TestFilter_AncestorKSDoesNotPullInUnrelatedSiblings(t *testing.T) {
 	// Two leaf KSes under the same meta-KS. Only plex changes. plex
 	// + meta are kept; atuin (an unrelated sibling under the meta-KS)
