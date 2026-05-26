@@ -648,6 +648,42 @@ func TestFilter_AddEmittedFromPrimaryParent(t *testing.T) {
 // mode in ways the user can't see. The empty-namespace bridge in
 // TestFilter_ShouldReconcileEmptyNamespaceFallback is preserved
 // because it indexes only entries whose Namespace is empty.
+func TestFilter_AddEmittedKeepsSubstituteFromProducerDependencyOnly(t *testing.T) {
+	parent := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "flux-system", Name: "cluster-apps"}
+	child := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "apps", Name: "leaf"}
+	producer := &manifest.Kustomization{
+		Name: "cluster-vars", Namespace: "flux-system",
+		KustomizationSpec: kustomizev1.KustomizationSpec{Path: "kubernetes/flux/vars"},
+	}
+	leaf := &manifest.Kustomization{
+		Name: "leaf", Namespace: "apps",
+		PostBuildSubstituteFrom: []manifest.SubstituteReference{{Kind: manifest.KindConfigMap, Name: "cluster-settings"}},
+	}
+	cmID := manifest.NamedResource{Kind: manifest.KindConfigMap, Name: "cluster-settings"}
+
+	f := NewFilter(
+		NewSet([]string{"kubernetes/apps/parent.yaml"}),
+		map[manifest.NamedResource]string{
+			parent:           "kubernetes/apps/parent.yaml",
+			producer.Named(): "kubernetes/flux/cluster-vars.yaml",
+			cmID:             "kubernetes/flux/vars/cluster-settings.yaml",
+		},
+		"",
+		mapLister{child: leaf, producer.Named(): producer},
+	)
+	if !f.ShouldReconcile(parent) {
+		t.Fatalf("parent must be primary from direct file change; keep=%v", f.KeepNames())
+	}
+
+	f.AddEmitted(parent, child)
+	if !f.ShouldReconcile(producer.Named()) {
+		t.Fatalf("substituteFrom producer should be kept; keep=%v", f.KeepNames())
+	}
+	if _, primary := f.primary[producer.Named()]; primary {
+		t.Errorf("runtime substituteFrom producer should stay dependency-only, not primary; keep=%v", f.KeepNames())
+	}
+}
+
 func TestFilter_KeepByNameDoesNotLeakAcrossNamespaces(t *testing.T) {
 	kept := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "cluster-infra", Name: "external-secrets"}
 	collider := manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "database", Name: "external-secrets"}

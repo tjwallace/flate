@@ -294,10 +294,11 @@ func (f *Filter) addRecursiveLocked(id manifest.NamedResource) []manifest.NamedR
 		if f.objs == nil {
 			continue
 		}
-		for _, dep := range f.transitiveDepsAndProducers(cur) {
+		for _, dep := range transitiveDeps(f.objs, cur) {
 			if _, ok := f.primary[dep]; !ok {
 				stack = append(stack, dep)
 			}
+			added = append(added, f.addDependencyOnlyRecursiveLocked(f.producersFor(dep)...)...)
 		}
 	}
 	return added
@@ -470,17 +471,29 @@ func buildProducerIndex(sourceFiles map[manifest.NamedResource]string, owners ow
 	return byID, byName
 }
 
-func (f *Filter) transitiveDepsAndProducers(id manifest.NamedResource) []manifest.NamedResource {
-	deps := transitiveDeps(f.objs, id)
-	if len(deps) == 0 {
-		return nil
+func (f *Filter) addDependencyOnlyRecursiveLocked(ids ...manifest.NamedResource) []manifest.NamedResource {
+	var added []manifest.NamedResource
+	stack := slices.Clone(ids)
+	for len(stack) > 0 {
+		cur := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if _, alreadyKeep := f.keep[cur]; alreadyKeep {
+			continue
+		}
+		f.keep[cur] = struct{}{}
+		if cur.Namespace == "" {
+			f.keepByName[nameKey{cur.Kind, cur.Name}] = struct{}{}
+		}
+		added = append(added, cur)
+		if f.objs == nil {
+			continue
+		}
+		for _, dep := range transitiveDeps(f.objs, cur) {
+			stack = append(stack, dep)
+			stack = appendUniqueIDs(stack, f.producersFor(dep)...)
+		}
 	}
-	out := make([]manifest.NamedResource, 0, len(deps))
-	for _, dep := range deps {
-		out = append(out, dep)
-		out = appendUniqueIDs(out, f.producersFor(dep)...)
-	}
-	return out
+	return added
 }
 
 // ProducersFor returns Flux Kustomizations that render the file-backed
