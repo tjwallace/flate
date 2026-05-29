@@ -3,6 +3,9 @@ package diff
 import (
 	"bytes"
 	"cmp"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"slices"
@@ -101,8 +104,8 @@ func joinNS(ns, name string) string {
 // HelmRelease A doesn't accidentally diff against the same-named
 // Deployment from HelmRelease B.
 func Run(left, right []Doc, opts Options) ([]ResourceDiff, error) {
-	left = applyStrip(left, opts.StripAttrs)
-	right = applyStrip(right, opts.StripAttrs)
+	left = normalizeDocs(left, opts.StripAttrs)
+	right = normalizeDocs(right, opts.StripAttrs)
 	pairs := pair(left, right)
 	out := make([]ResourceDiff, 0, len(pairs))
 	for _, p := range pairs {
@@ -224,9 +227,9 @@ type pairKey struct {
 	// pPath disambiguates two KS parents with the same (kind, ns, name)
 	// but different spec.path — a real-world collision in repos where
 	// the same KS is rendered twice from different overlays.
-	pKind, pNS, pName, pPath  string
-	apiVersion                string
-	kind, ns, name            string
+	pKind, pNS, pName, pPath string
+	apiVersion               string
+	kind, ns, name           string
 }
 
 func pair(left, right []Doc) []pairedResource {
@@ -271,19 +274,63 @@ func pair(left, right []Doc) []pairedResource {
 	return out
 }
 
-// applyStrip clones each Doc's manifest and removes the listed
-// annotation/label keys before the diff runs. Deep-copies so the
-// original tree (used by other consumers in the same orchestrator
+// normalizeDocs clones each Doc's manifest and normalizes fields that
+// should not participate verbatim in human-facing diffs. Deep-copies so
+// the original tree (used by other consumers in the same orchestrator
 // run) is untouched.
-func applyStrip(docs []Doc, attrs []string) []Doc {
-	if len(attrs) == 0 {
+func normalizeDocs(docs []Doc, attrs []string) []Doc {
+	if len(attrs) == 0 && !docsContainBinaryData(docs) {
 		return docs
 	}
 	out := make([]Doc, len(docs))
 	for i, d := range docs {
 		copyDoc := manifest.DeepCopyMap(d.Manifest)
 		manifest.StripResourceAttributes(copyDoc, attrs)
+		redactBinaryData(copyDoc)
 		out[i] = Doc{Manifest: copyDoc, Parent: d.Parent}
 	}
 	return out
+}
+
+func docsContainBinaryData(docs []Doc) bool {
+	for _, d := range docs {
+		if _, ok := d.Manifest["binaryData"]; ok && manifest.DocKind(d.Manifest) == manifest.KindConfigMap {
+			return true
+		}
+	}
+	return false
+}
+
+// redactBinaryData replaces ConfigMap.binaryData values with compact,
+// content-derived summaries before diffing. The field is explicitly
+// base64-encoded binary payload; trying to produce a scalar text diff
+// for it is both noisy and pathologically slow for large hook-generated
+// blobs such as kube-prometheus-stack's CRD upgrade bundle. Hash-backed
+// summaries preserve the useful signal (unchanged vs changed) without
+// printing the binary/base64 value itself.
+func redactBinaryData(doc map[string]any) {
+	if manifest.DocKind(doc) != manifest.KindConfigMap {
+		return
+	}
+	binaryData, ok := doc["binaryData"].(map[string]any)
+	if !ok {
+		return
+	}
+	for k, v := range binaryData {
+		binaryData[k] = binaryDataSummary(v)
+	}
+}
+
+func binaryDataSummary(v any) string {
+	s, ok := v.(string)
+	if !ok {
+		return "<redacted binary data>"
+	}
+	decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(s))
+	if err != nil {
+		sum := sha256.Sum256([]byte(s))
+		return fmt.Sprintf("<redacted binary data: %d base64 chars sha256:%s>", len(s), hex.EncodeToString(sum[:8]))
+	}
+	sum := sha256.Sum256(decoded)
+	return fmt.Sprintf("<redacted binary data: %d bytes sha256:%s>", len(decoded), hex.EncodeToString(sum[:8]))
 }

@@ -398,6 +398,54 @@ func TestRun_StripAttrsRemovesNoise(t *testing.T) {
 	}
 }
 
+func TestRun_RedactsConfigMapBinaryData(t *testing.T) {
+	mk := func(blob, data string) []Doc {
+		return []Doc{{
+			Manifest: map[string]any{
+				"kind": "ConfigMap",
+				"metadata": map[string]any{
+					"name": "binary", "namespace": "ns",
+				},
+				"binaryData": map[string]any{"payload.bin": blob},
+				"data":       map[string]any{"visible": data},
+			},
+		}}
+	}
+
+	diffs, err := Run(mk("QUFBQQ==", "same"), mk("QkJCQg==", "same"), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(diffs) != 1 {
+		t.Fatalf("binaryData-only change should surface as a redacted diff, got %d diff(s)", len(diffs))
+	}
+	body := diffs[0].Diff
+	if !strings.Contains(body, "@@ binaryData.payload.bin @@") {
+		t.Errorf("expected binaryData path to remain; got:\n%s", body)
+	}
+	if !strings.Contains(body, "redacted binary data") {
+		t.Errorf("expected redaction marker; got:\n%s", body)
+	}
+	if strings.Contains(body, "QUFBQQ==") || strings.Contains(body, "QkJCQg==") {
+		t.Errorf("raw binaryData leaked into diff body:\n%s", body)
+	}
+
+	diffs, err = Run(mk("QUFBQQ==", "old"), mk("QkJCQg==", "new"), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(diffs) != 1 {
+		t.Fatalf("non-binary data change should still surface, got %d diff(s)", len(diffs))
+	}
+	body = diffs[0].Diff
+	if strings.Contains(body, "QUFBQQ==") || strings.Contains(body, "QkJCQg==") {
+		t.Errorf("raw binaryData leaked into diff body:\n%s", body)
+	}
+	if !strings.Contains(body, "@@ data.visible @@") {
+		t.Errorf("expected visible data change to remain; got:\n%s", body)
+	}
+}
+
 // TestRun_DistinguishesByParent locks the parent-aware pairing: two
 // HelmReleases each rendering a same-named Deployment are tracked
 // independently — a change to HR/a's copy doesn't leak into a phantom
