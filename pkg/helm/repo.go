@@ -296,5 +296,13 @@ func absChartURL(base, urlStr string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// HelmRepository spec.url denotes a repository directory even when
+	// it has no trailing slash. net/url treats a slashless final path
+	// element as a file and would resolve "charts/x.tgz" against
+	// https://host/repo as https://host/charts/x.tgz; Helm resolves it
+	// as https://host/repo/charts/x.tgz.
+	if !strings.HasSuffix(baseURL.Path, "/") {
+		baseURL.Path += "/"
+	}
 	return baseURL.ResolveReference(u).String(), nil
 }

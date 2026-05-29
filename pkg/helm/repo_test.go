@@ -137,6 +137,50 @@ func TestLocateHelmRepoChart_NoDigestDoesNotPersistMutableVersion(t *testing.T) 
 	}
 }
 
+func TestAbsChartURL_TreatsRepoURLAsDirectory(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		base   string
+		urlStr string
+		want   string
+	}{
+		{
+			name:   "repo subpath without trailing slash",
+			base:   "https://helm.ngc.nvidia.com/nvidia",
+			urlStr: "charts/gpu-operator-v26.3.2.tgz",
+			want:   "https://helm.ngc.nvidia.com/nvidia/charts/gpu-operator-v26.3.2.tgz",
+		},
+		{
+			name:   "repo subpath with trailing slash",
+			base:   "https://helm.ngc.nvidia.com/nvidia/",
+			urlStr: "charts/gpu-operator-v26.3.2.tgz",
+			want:   "https://helm.ngc.nvidia.com/nvidia/charts/gpu-operator-v26.3.2.tgz",
+		},
+		{
+			name:   "absolute chart URL unchanged",
+			base:   "https://repo.example/charts",
+			urlStr: "https://cdn.example/app-1.0.0.tgz",
+			want:   "https://cdn.example/app-1.0.0.tgz",
+		},
+		{
+			name:   "root-relative chart URL stays host-rooted",
+			base:   "https://repo.example/charts",
+			urlStr: "/assets/app-1.0.0.tgz",
+			want:   "https://repo.example/assets/app-1.0.0.tgz",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := absChartURL(tc.base, tc.urlStr)
+			if err != nil {
+				t.Fatalf("absChartURL: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("absChartURL(%q, %q) = %q, want %q", tc.base, tc.urlStr, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestPullHelmRepoOCI_PreservesProvider(t *testing.T) {
 	c, err := NewClient(cacheroot.New(t.TempDir()))
 	if err != nil {
